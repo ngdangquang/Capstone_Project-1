@@ -1,0 +1,859 @@
+// Top module for Semantic Segmentation implementation on DE10 Standard Kit
+module semantic_segmentation_top (
+    input wire clk,
+    input wire reset_n,
+    // Input image interface
+    input wire start_process,
+    input wire [7:0] pixel_data_in,
+    input wire pixel_valid_in,
+    // Output interface
+    output wire [7:0] segmentation_result,
+    output wire result_valid,
+    output wire processing_done,
+    // Memory interface
+    output wire [19:0] sdram_addr,
+    inout wire [31:0] sdram_data,
+    output wire sdram_we_n,
+    output wire sdram_cs_n,
+    // Status LEDs
+    output wire [9:0] status_leds
+);
+
+    // Parameters for the entire network
+    localparam INPUT_WIDTH = 224;
+    localparam INPUT_HEIGHT = 224;
+    localparam INPUT_CHANNELS = 3;
+    localparam NUM_CLASSES = 21; // For common semantic segmentation datasets
+    
+    // Clock and reset signals
+    wire sys_clk;
+    wire sys_rst;
+    
+    // PLL for clock generation
+    pll system_pll (
+        .inclk0(clk),
+        .c0(sys_clk)
+    );
+    
+    // Reset synchronization
+    reg [2:0] reset_sync;
+    always @(posedge sys_clk or negedge reset_n) begin
+        if (!reset_n)
+            reset_sync <= 3'b111;
+        else
+            reset_sync <= {reset_sync[1:0], 1'b0};
+    end
+    assign sys_rst = reset_sync[2];
+    
+    // State machine states
+    localparam IDLE = 3'd0;
+    localparam LOAD_IMAGE = 3'd1;
+    localparam ENCODE = 3'd2;
+    localparam DECODE = 3'd3;
+    localparam OUTPUT_RESULT = 3'd4;
+    
+    reg [2:0] state, next_state;
+    
+    // Control signals
+    reg encoder_start, decoder_start;
+    wire encoder_done, decoder_done;
+    
+    // Memory for storing the input image
+    reg [7:0] input_buffer [0:INPUT_WIDTH*INPUT_HEIGHT*INPUT_CHANNELS-1];
+    reg [19:0] input_write_addr;
+    reg input_write_en;
+    
+    // Feature map memory 
+    reg [15:0] feature_maps [0:INPUT_WIDTH/8*INPUT_HEIGHT/8*256-1]; // Compressed feature maps
+    
+    // Output memory
+    reg [7:0] output_buffer [0:INPUT_WIDTH*INPUT_HEIGHT-1];
+    reg [19:0] output_read_addr;
+    
+    // Image buffer control
+    always @(posedge sys_clk or posedge sys_rst) begin
+        if (sys_rst) begin
+            input_write_addr <= 0;
+            input_write_en <= 0;
+        end else if (state == LOAD_IMAGE && pixel_valid_in) begin
+            input_buffer[input_write_addr] <= pixel_data_in;
+            input_write_addr <= input_write_addr + 1;
+            input_write_en <= 1;
+        end else begin
+            input_write_en <= 0;
+        end
+    end
+    
+    // State machine
+    always @(posedge sys_clk or posedge sys_rst) begin
+        if (sys_rst) begin
+            state <= IDLE;
+        end else begin
+            state <= next_state;
+        end
+    end
+    
+    // Next state logic
+    always @(*) begin
+        next_state = state;
+        encoder_start = 1'b0;
+        decoder_start = 1'b0;
+        
+        case (state)
+            IDLE: begin
+                if (start_process)
+                    next_state = LOAD_IMAGE;
+            end
+            
+            LOAD_IMAGE: begin
+                if (input_write_addr >= INPUT_WIDTH*INPUT_HEIGHT*INPUT_CHANNELS) begin
+                    next_state = ENCODE;
+                    encoder_start = 1'b1;
+                end
+            end
+            
+            ENCODE: begin
+                if (encoder_done) begin
+                    next_state = DECODE;
+                    decoder_start = 1'b1;
+                end
+            end
+            
+            DECODE: begin
+                if (decoder_done)
+                    next_state = OUTPUT_RESULT;
+            end
+            
+            OUTPUT_RESULT: begin
+                if (output_read_addr >= INPUT_WIDTH*INPUT_HEIGHT)
+                    next_state = IDLE;
+            end
+            
+            default: next_state = IDLE;
+        endcase
+    end
+    
+    // Status outputs
+    assign status_leds[2:0] = state;
+    assign status_leds[3] = encoder_done;
+    assign status_leds[4] = decoder_done;
+    assign status_leds[9:5] = 5'b0;
+    
+    // Output control
+    assign processing_done = (state == IDLE);
+    assign result_valid = (state == OUTPUT_RESULT);
+    assign segmentation_result = (state == OUTPUT_RESULT) ? output_buffer[output_read_addr] : 8'd0;
+    
+    // Output address counter
+    always @(posedge sys_clk or posedge sys_rst) begin
+        if (sys_rst) begin
+            output_read_addr <= 0;
+        end else if (state == OUTPUT_RESULT) begin
+            output_read_addr <= output_read_addr + 1;
+        end else begin
+            output_read_addr <= 0;
+        end
+    end
+    
+    // Instantiate the encoder (downsampling path)
+    u_net_encoder encoder (
+        .clk(sys_clk),
+        .rst(sys_rst),
+        .start(encoder_start),
+        .input_data(input_buffer),
+        .feature_maps(feature_maps),
+        .done(encoder_done)
+    );
+    
+    // Instantiate the decoder (upsampling path)
+    u_net_decoder decoder (
+        .clk(sys_clk),
+        .rst(sys_rst),
+        .start(decoder_start),
+        .feature_maps(feature_maps),
+        .output_data(output_buffer),
+        .done(decoder_done)
+    );
+
+endmodule
+
+// U-Net Encoder module - Downsampling path
+module u_net_encoder (
+    input wire clk,
+    input wire rst,
+    input wire start,
+    input wire [7:0] input_data [0:224*224*3-1],
+    output reg [15:0] feature_maps [0:28*28*256-1],
+    output reg done
+);
+    // Parameters
+    localparam INPUT_SIZE = 224;
+    localparam CONV1_CHANNELS = 64;
+    localparam CONV2_CHANNELS = 128;
+    localparam CONV3_CHANNELS = 256;
+    
+    // Internal signals
+    reg [2:0] stage;
+    reg stage_start;
+    wire stage_done;
+    
+    // Temporary feature maps between stages
+    reg [15:0] stage1_output [0:112*112*64-1];
+    reg [15:0] stage2_output [0:56*56*128-1];
+    
+    // Stage control
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            stage <= 3'd0;
+            done <= 1'b0;
+            stage_start <= 1'b0;
+        end else begin
+            if (start && stage == 3'd0) begin
+                stage <= 3'd1;
+                stage_start <= 1'b1;
+            end else if (stage_done) begin
+                if (stage < 3'd3) begin
+                    stage <= stage + 1'b1;
+                    stage_start <= 1'b1;
+                end else begin
+                    done <= 1'b1;
+                    stage <= 3'd0;
+                end
+            end else begin
+                stage_start <= 1'b0;
+            end
+        end
+    end
+    
+    // Stage implementations
+    encoder_stage1 stage1_inst (
+        .clk(clk),
+        .rst(rst),
+        .start(stage_start && stage == 3'd1),
+        .input_data(input_data),
+        .output_data(stage1_output),
+        .done(stage_done_1)
+    );
+    
+    encoder_stage2 stage2_inst (
+        .clk(clk),
+        .rst(rst),
+        .start(stage_start && stage == 3'd2),
+        .input_data(stage1_output),
+        .output_data(stage2_output),
+        .done(stage_done_2)
+    );
+    
+    encoder_stage3 stage3_inst (
+        .clk(clk),
+        .rst(rst),
+        .start(stage_start && stage == 3'd3),
+        .input_data(stage2_output),
+        .output_data(feature_maps),
+        .done(stage_done_3)
+    );
+    
+    assign stage_done = (stage == 3'd1) ? stage_done_1 :
+                       (stage == 3'd2) ? stage_done_2 :
+                       (stage == 3'd3) ? stage_done_3 : 1'b0;
+    
+endmodule
+
+// Encoder Stage 1: Input -> Conv -> ReLU -> MaxPool
+module encoder_stage1 (
+    input wire clk,
+    input wire rst,
+    input wire start,
+    input wire [7:0] input_data [0:224*224*3-1],
+    output reg [15:0] output_data [0:112*112*64-1],
+    output reg done
+);
+    // Stage control
+    reg [1:0] substage;
+    reg conv_start, pool_start;
+    wire conv_done, pool_done;
+    
+    // Intermediate data
+    reg [15:0] conv_output [0:224*224*64-1];
+    
+    // Control logic
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            substage <= 2'd0;
+            conv_start <= 1'b0;
+            pool_start <= 1'b0;
+            done <= 1'b0;
+        end else begin
+            if (start && substage == 2'd0) begin
+                substage <= 2'd1;
+                conv_start <= 1'b1;
+            end else if (conv_done && substage == 2'd1) begin
+                substage <= 2'd2;
+                pool_start <= 1'b1;
+                conv_start <= 1'b0;
+            end else if (pool_done && substage == 2'd2) begin
+                substage <= 2'd0;
+                pool_start <= 1'b0;
+                done <= 1'b1;
+            end else begin
+                conv_start <= 1'b0;
+                pool_start <= 1'b0;
+                if (!start) done <= 1'b0;
+            end
+        end
+    end
+    
+    // Convolution layer: 3->64 channels, 3x3 kernel
+    conv2d #(
+        .DATA_WIDTH(16),
+        .CHANNELS_IN(3),
+        .CHANNELS_OUT(64),
+        .INPUT_SIZE(224),
+        .KERNEL_SIZE(3),
+        .STRIDE(1),
+        .OUTPUT_SIZE(224)
+    ) conv1 (
+        .clk(clk),
+        .rst(rst),
+        .start(conv_start),
+        .input_data(input_data),
+        .output_data(conv_output),
+        .valid_out(conv_done)
+    );
+    
+    // Max pooling layer: 2x2 with stride 2
+    max_pool2d #(
+        .DATA_WIDTH(16),
+        .CHANNELS(64),
+        .INPUT_SIZE(224),
+        .POOL_SIZE(2),
+        .STRIDE(2),
+        .OUTPUT_SIZE(112)
+    ) pool1 (
+        .clk(clk),
+        .rst(rst),
+        .start(pool_start),
+        .input_data(conv_output),
+        .output_data(output_data),
+        .valid_out(pool_done)
+    );
+    
+endmodule
+
+// Encoder Stage 2: 64 -> 128 channels with downsample
+module encoder_stage2 (
+    input wire clk,
+    input wire rst,
+    input wire start,
+    input wire [15:0] input_data [0:112*112*64-1],
+    output reg [15:0] output_data [0:56*56*128-1],
+    output reg done
+);
+    // Stage control
+    reg [1:0] substage;
+    reg conv_start, pool_start;
+    wire conv_done, pool_done;
+    
+    // Intermediate data
+    reg [15:0] conv_output [0:112*112*128-1];
+    
+    // Control logic
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            substage <= 2'd0;
+            conv_start <= 1'b0;
+            pool_start <= 1'b0;
+            done <= 1'b0;
+        end else begin
+            if (start && substage == 2'd0) begin
+                substage <= 2'd1;
+                conv_start <= 1'b1;
+            end else if (conv_done && substage == 2'd1) begin
+                substage <= 2'd2;
+                pool_start <= 1'b1;
+                conv_start <= 1'b0;
+            end else if (pool_done && substage == 2'd2) begin
+                substage <= 2'd0;
+                pool_start <= 1'b0;
+                done <= 1'b1;
+            end else begin
+                conv_start <= 1'b0;
+                pool_start <= 1'b0;
+                if (!start) done <= 1'b0;
+            end
+        end
+    end
+    
+    // Convolution layer: 64->128 channels, 3x3 kernel
+    conv2d #(
+        .DATA_WIDTH(16),
+        .CHANNELS_IN(64),
+        .CHANNELS_OUT(128),
+        .INPUT_SIZE(112),
+        .KERNEL_SIZE(3),
+        .STRIDE(1),
+        .OUTPUT_SIZE(112)
+    ) conv2 (
+        .clk(clk),
+        .rst(rst),
+        .start(conv_start),
+        .input_data(input_data),
+        .output_data(conv_output),
+        .valid_out(conv_done)
+    );
+    
+    // Max pooling layer: 2x2 with stride 2
+    max_pool2d #(
+        .DATA_WIDTH(16),
+        .CHANNELS(128),
+        .INPUT_SIZE(112),
+        .POOL_SIZE(2),
+        .STRIDE(2),
+        .OUTPUT_SIZE(56)
+    ) pool2 (
+        .clk(clk),
+        .rst(rst),
+        .start(pool_start),
+        .input_data(conv_output),
+        .output_data(output_data),
+        .valid_out(pool_done)
+    );
+    
+endmodule
+
+// Encoder Stage 3: 128 -> 256 channels with downsample
+module encoder_stage3 (
+    input wire clk,
+    input wire rst,
+    input wire start,
+    input wire [15:0] input_data [0:56*56*128-1],
+    output reg [15:0] output_data [0:28*28*256-1],
+    output reg done
+);
+    // Stage control
+    reg [1:0] substage;
+    reg conv_start, pool_start;
+    wire conv_done, pool_done;
+    
+    // Intermediate data
+    reg [15:0] conv_output [0:56*56*256-1];
+    
+    // Control logic
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            substage <= 2'd0;
+            conv_start <= 1'b0;
+            pool_start <= 1'b0;
+            done <= 1'b0;
+        end else begin
+            if (start && substage == 2'd0) begin
+                substage <= 2'd1;
+                conv_start <= 1'b1;
+            end else if (conv_done && substage == 2'd1) begin
+                substage <= 2'd2;
+                pool_start <= 1'b1;
+                conv_start <= 1'b0;
+            end else if (pool_done && substage == 2'd2) begin
+                substage <= 2'd0;
+                pool_start <= 1'b0;
+                done <= 1'b1;
+            end else begin
+                conv_start <= 1'b0;
+                pool_start <= 1'b0;
+                if (!start) done <= 1'b0;
+            end
+        end
+    end
+    
+    // Convolution layer: 128->256 channels, 3x3 kernel
+    conv2d #(
+        .DATA_WIDTH(16),
+        .CHANNELS_IN(128),
+        .CHANNELS_OUT(256),
+        .INPUT_SIZE(56),
+        .KERNEL_SIZE(3),
+        .STRIDE(1),
+        .OUTPUT_SIZE(56)
+    ) conv3 (
+        .clk(clk),
+        .rst(rst),
+        .start(conv_start),
+        .input_data(input_data),
+        .output_data(conv_output),
+        .valid_out(conv_done)
+    );
+    
+    // Max pooling layer: 2x2 with stride 2
+    max_pool2d #(
+        .DATA_WIDTH(16),
+        .CHANNELS(256),
+        .INPUT_SIZE(56),
+        .POOL_SIZE(2),
+        .STRIDE(2),
+        .OUTPUT_SIZE(28)
+    ) pool3 (
+        .clk(clk),
+        .rst(rst),
+        .start(pool_start),
+        .input_data(conv_output),
+        .output_data(output_data),
+        .valid_out(pool_done)
+    );
+    
+endmodule
+
+// U-Net Decoder module - Upsampling path
+module u_net_decoder (
+    input wire clk,
+    input wire rst,
+    input wire start,
+    input wire [15:0] feature_maps [0:28*28*256-1],
+    output reg [7:0] output_data [0:224*224-1],
+    output reg done
+);
+    // Parameters
+    localparam BOTTLENECK_SIZE = 28;
+    
+    // Internal signals
+    reg [2:0] stage;
+    reg stage_start;
+    wire stage_done;
+    
+    // Temporary feature maps between stages
+    reg [15:0] stage1_output [0:56*56*128-1];
+    reg [15:0] stage2_output [0:112*112*64-1];
+    
+    // Stage control
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            stage <= 3'd0;
+            done <= 1'b0;
+            stage_start <= 1'b0;
+        end else begin
+            if (start && stage == 3'd0) begin
+                stage <= 3'd1;
+                stage_start <= 1'b1;
+            end else if (stage_done) begin
+                if (stage < 3'd3) begin
+                    stage <= stage + 1'b1;
+                    stage_start <= 1'b1;
+                end else begin
+                    done <= 1'b1;
+                    stage <= 3'd0;
+                end
+            end else begin
+                stage_start <= 1'b0;
+            end
+        end
+    end
+    
+    // Stage implementations
+    decoder_stage1 stage1_inst (
+        .clk(clk),
+        .rst(rst),
+        .start(stage_start && stage == 3'd1),
+        .input_data(feature_maps),
+        .output_data(stage1_output),
+        .done(stage_done_1)
+    );
+    
+    decoder_stage2 stage2_inst (
+        .clk(clk),
+        .rst(rst),
+        .start(stage_start && stage == 3'd2),
+        .input_data(stage1_output),
+        .output_data(stage2_output),
+        .done(stage_done_2)
+    );
+    
+    decoder_stage3 stage3_inst (
+        .clk(clk),
+        .rst(rst),
+        .start(stage_start && stage == 3'd3),
+        .input_data(stage2_output),
+        .output_data(output_data),
+        .done(stage_done_3)
+    );
+    
+    assign stage_done = (stage == 3'd1) ? stage_done_1 :
+                       (stage == 3'd2) ? stage_done_2 :
+                       (stage == 3'd3) ? stage_done_3 : 1'b0;
+    
+endmodule
+
+// Decoder Stage 1: 256 -> 128 channels with upsample
+module decoder_stage1 (
+    input wire clk,
+    input wire rst,
+    input wire start,
+    input wire [15:0] input_data [0:28*28*256-1],
+    output reg [15:0] output_data [0:56*56*128-1],
+    output reg done
+);
+    // Stage control
+    reg [1:0] substage;
+    reg upconv_start, conv_start;
+    wire upconv_done, conv_done;
+    
+    // Intermediate data
+    reg [15:0] upconv_output [0:56*56*128-1];
+    
+    // Control logic
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            substage <= 2'd0;
+            upconv_start <= 1'b0;
+            conv_start <= 1'b0;
+            done <= 1'b0;
+        end else begin
+            if (start && substage == 2'd0) begin
+                substage <= 2'd1;
+                upconv_start <= 1'b1;
+            end else if (upconv_done && substage == 2'd1) begin
+                substage <= 2'd2;
+                conv_start <= 1'b1;
+                upconv_start <= 1'b0;
+            end else if (conv_done && substage == 2'd2) begin
+                substage <= 2'd0;
+                conv_start <= 1'b0;
+                done <= 1'b1;
+            end else begin
+                upconv_start <= 1'b0;
+                conv_start <= 1'b0;
+                if (!start) done <= 1'b0;
+            end
+        end
+    end
+    
+    // Transpose convolution (upsampling)
+    transpose_conv2d #(
+        .DATA_WIDTH(16),
+        .CHANNELS_IN(256),
+        .CHANNELS_OUT(128),
+        .INPUT_SIZE(28),
+        .KERNEL_SIZE(2),
+        .STRIDE(2),
+        .OUTPUT_SIZE(56)
+    ) upconv1 (
+        .clk(clk),
+        .rst(rst),
+        .start(upconv_start),
+        .input_data(input_data),
+        .output_data(upconv_output),
+        .valid_out(upconv_done)
+    );
+    
+    // Convolution layer after upsampling
+    conv2d #(
+        .DATA_WIDTH(16),
+        .CHANNELS_IN(128),
+        .CHANNELS_OUT(128),
+        .INPUT_SIZE(56),
+        .KERNEL_SIZE(3),
+        .STRIDE(1),
+        .OUTPUT_SIZE(56)
+    ) conv4 (
+        .clk(clk),
+        .rst(rst),
+        .start(conv_start),
+        .input_data(upconv_output),
+        .output_data(output_data),
+        .valid_out(conv_done)
+    );
+    
+endmodule
+
+// Decoder Stage 2: 128 -> 64 channels with upsample
+module decoder_stage2 (
+    input wire clk,
+    input wire rst,
+    input wire start,
+    input wire [15:0] input_data [0:56*56*128-1],
+    output reg [15:0] output_data [0:112*112*64-1],
+    output reg done
+);
+    // Stage control
+    reg [1:0] substage;
+    reg upconv_start, conv_start;
+    wire upconv_done, conv_done;
+    
+    // Intermediate data
+    reg [15:0] upconv_output [0:112*112*64-1];
+    
+    // Control logic
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            substage <= 2'd0;
+            upconv_start <= 1'b0;
+            conv_start <= 1'b0;
+            done <= 1'b0;
+        end else begin
+            if (start && substage == 2'd0) begin
+                substage <= 2'd1;
+                upconv_start <= 1'b1;
+            end else if (upconv_done && substage == 2'd1) begin
+                substage <= 2'd2;
+                conv_start <= 1'b1;
+                upconv_start <= 1'b0;
+            end else if (conv_done && substage == 2'd2) begin
+                substage <= 2'd0;
+                conv_start <= 1'b0;
+                done <= 1'b1;
+            end else begin
+                upconv_start <= 1'b0;
+                conv_start <= 1'b0;
+                if (!start) done <= 1'b0;
+            end
+        end
+    end
+    
+    // Transpose convolution (upsampling)
+    transpose_conv2d #(
+        .DATA_WIDTH(16),
+        .CHANNELS_IN(128),
+        .CHANNELS_OUT(64),
+        .INPUT_SIZE(56),
+        .KERNEL_SIZE(2),
+        .STRIDE(2),
+        .OUTPUT_SIZE(112)
+    ) upconv2 (
+        .clk(clk),
+        .rst(rst),
+        .start(upconv_start),
+        .input_data(input_data),
+        .output_data(upconv_output),
+        .valid_out(upconv_done)
+    );
+    
+    // Convolution layer after upsampling
+    conv2d #(
+        .DATA_WIDTH(16),
+        .CHANNELS_IN(64),
+        .CHANNELS_OUT(64),
+        .INPUT_SIZE(112),
+        .KERNEL_SIZE(3),
+        .STRIDE(1),
+        .OUTPUT_SIZE(112)
+    ) conv5 (
+        .clk(clk),
+        .rst(rst),
+        .start(conv_start),
+        .input_data(upconv_output),
+        .output_data(output_data),
+        .valid_out(conv_done)
+    );
+    
+endmodule
+
+// Decoder Stage 3: 64 -> NUM_CLASSES with upsample
+module decoder_stage3 (
+    input wire clk,
+    input wire rst,
+    input wire start,
+    input wire [15:0] input_data [0:112*112*64-1],
+    output reg [7:0] output_data [0:224*224-1],
+    output reg done
+);
+    // Stage control
+    reg [2:0] substage;
+    reg upconv_start, conv_start, class_start, argmax_start;
+    wire upconv_done, conv_done, class_done, argmax_done;
+    
+    // Parameters
+    localparam NUM_CLASSES = 21;
+    
+    // Intermediate data
+    reg [15:0] upconv_output [0:224*224*64-1];
+    reg [15:0] conv_output [0:224*224*32-1];
+    reg [15:0] class_output [0:224*224*NUM_CLASSES-1];
+    
+    // Control logic
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            substage <= 3'd0;
+            upconv_start <= 1'b0;
+            conv_start <= 1'b0;
+            class_start <= 1'b0;
+            argmax_start <= 1'b0;
+            done <= 1'b0;
+        end else begin
+            if (start && substage == 3'd0) begin
+                substage <= 3'd1;
+                upconv_start <= 1'b1;
+            end else if (upconv_done && substage == 3'd1) begin
+                substage <= 3'd2;
+                conv_start <= 1'b1;
+                upconv_start <= 1'b0;
+            end else if (conv_done && substage == 3'd2) begin
+                substage <= 3'd3;
+                class_start <= 1'b1;
+                conv_start <= 1'b0;
+            end else if (class_done && substage == 3'd3) begin
+                substage <= 3'd4;
+                argmax_start <= 1'b1;
+                class_start <= 1'b0;
+            end else if (argmax_done && substage == 3'd4) begin
+                substage <= 3'd0;
+                argmax_start <= 1'b0;
+                done <= 1'b1;
+            end else begin
+                upconv_start <= 1'b0;
+                conv_start <= 1'b0;
+                class_start <= 1'b0;
+                argmax_start <= 1'b0;
+                if (!start) done <= 1'b0;
+            end
+        end
+    end
+    
+    // Transpose convolution (upsampling)
+    transpose_conv2d #(
+        .DATA_WIDTH(16),
+        .CHANNELS_IN(64),
+        .CHANNELS_OUT(64),
+        .INPUT_SIZE(112),
+        .KERNEL_SIZE(2),
+        .STRIDE(2),
+        .OUTPUT_SIZE(224)
+    ) upconv3 (
+        .clk(clk),
+        .rst(rst),
+        .start(upconv_start),
+        .input_data(input_data),
+        .output_data(upconv_output),
+        .valid_out(upconv_done)
+    );
+    
+    // Convolution layer after upsampling
+    conv2d #(
+        .DATA_WIDTH(16),
+        .CHANNELS_IN(64),
+        .CHANNELS_OUT(32),
+        .INPUT_SIZE(224),
+        .KERNEL_SIZE(3),
+        .STRIDE(1),
+        .OUTPUT_SIZE(224)
+    ) conv6 (
+        .clk(clk),
+        .rst(rst),
+        .start(conv_start),
+        .input_data(upconv_output),
+        .output_data(conv_output),
+        .valid_out(conv_done)
+    );
+    
+    // Final classification layer
+    conv2d #(
+        .DATA_WIDTH(16),
+        .CHANNELS_IN(32),
+        .CHANNELS_OUT(NUM_CLASSES),
+        .INPUT_SIZE(224),
+        .KERNEL_SIZE(1),
+        .STRIDE(1),
+        .OUTPUT_SIZE(224)
+    ) class_conv (
+        .clk(clk),
+        .rst(rst),
+        .start(class_start),
+        .input_data(conv_output),
+        .output_data(class_output

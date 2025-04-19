@@ -1,0 +1,29 @@
+# Xử lý dữ liệu cơ bản
+numpy>=1.20.0
+pillow>=8.0.0
+matplotlib>=3.5.0
+
+# Xử lý ảnh và video
+opencv-python>=4.5.0
+scikit-image>=0.18.0
+
+# Hỗ trợ cho định dạng dữ liệu
+pyyaml>=6.0
+h5py>=3.6.0
+
+# Khung deep learning (nếu cần cho việc chuẩn bị trọng số)
+# Bỏ ghi chú nếu cần
+# tensorflow>=2.8.0
+# torch>=1.10.0
+# torchvision>=0.11.0
+
+# Công cụ mô phỏng và kiểm thử
+pytest>=6.0.0
+tqdm>=4.60.0
+
+# Hỗ trợ Jupyter cho phân tích (nếu cần)
+jupyter>=1.0.0
+ipywidgets>=7.6.0
+
+# Xử lý đường dẫn và hệ thống tệp
+pathlib>=1.0.1

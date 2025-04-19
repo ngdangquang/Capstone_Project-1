@@ -1,0 +1,1 @@
+Warning (10268): Verilog HDL information at fpga.v(33): always construct contains both blocking and non-blocking assignments File: C:/Capstone-Project-1/FPGA/fpga.v Line: 33
